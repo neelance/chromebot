@@ -35,8 +35,9 @@ type Step struct {
 }
 
 type Selector struct {
-	Text       string `json:"text"`
-	Background string `json:"background"`
+	Text       string             `json:"text"`
+	Background string             `json:"background"`
+	Attributes map[string]*string `json:"attributes"`
 }
 
 type testRunner struct {
@@ -183,6 +184,25 @@ func main() {
 			i := childIndex(parent, e.NodeId)
 			parent.Children = append(parent.Children[:i], parent.Children[i+1:]...)
 
+		case *dom.AttributeModifiedEvent:
+			n, ok := r.nodes[e.NodeId]
+			if !ok {
+				log.Printf("AttributeModifiedEvent: node not found: %d", e.NodeId)
+				break
+			}
+			removeAttribute(n, e.Name)
+			n.Attributes = append(n.Attributes, e.Name, e.Value)
+			r.searchDOM(n)
+
+		case *dom.AttributeRemovedEvent:
+			n, ok := r.nodes[e.NodeId]
+			if !ok {
+				log.Printf("AttributeRemovedEvent: node not found: %d", e.NodeId)
+				break
+			}
+			removeAttribute(n, e.Name)
+			r.searchDOM(n)
+
 		case *page.FrameNavigatedEvent:
 			if e.Frame.URL == "about:blank" {
 				break
@@ -271,22 +291,30 @@ func (r *testRunner) searchDOM(n *dom.Node) {
 func (r *testRunner) matchNode(n *dom.Node) {
 	switch r.currentStep.Action {
 	case "find", "click":
-		if !strings.Contains(visibleText(n), r.currentStep.Selector.Text) {
+		sel := r.currentStep.Selector
+
+		if !strings.Contains(visibleText(n), sel.Text) {
 			return
 		}
 
-		id := n.NodeId
 		if n.NodeType == NodeTypeText {
-			id = n.ParentId
+			n = r.nodes[n.ParentId]
 		}
 
-		if r.currentStep.Selector.Background != "" {
-			sc := r.getStyle(id, "background-color")
+		for name, expected := range sel.Attributes {
+			got, ok := getAttribute(n, name)
+			if (expected == nil && ok) || (expected != nil && (!ok || *expected != got)) {
+				return
+			}
+		}
+
+		if sel.Background != "" {
+			sc := r.getStyle(n.NodeId, "background-color")
 			c := parseCSSColor(sc)
 			if c == nil {
 				return
 			}
-			switch r.currentStep.Selector.Background {
+			switch sel.Background {
 			case "bright":
 				y, _, _ := color.RGBToYCbCr(c.R, c.G, c.B)
 				if y < 128 {
@@ -302,8 +330,17 @@ func (r *testRunner) matchNode(n *dom.Node) {
 			}
 		}
 
-		box, err := r.getBoxModel(id)
+		remoteObj, err := r.cl.DOM.ResolveNode().NodeId(n.NodeId).Do()
 		if err != nil {
+			log.Println(err)
+			return
+		}
+		r.cl.Runtime.CallFunctionOn().FunctionDeclaration("function(){this.scrollIntoViewIfNeeded(true);}").ObjectId(remoteObj.Object.ObjectId).Silent(true).Do()
+		r.cl.Runtime.ReleaseObject().ObjectId(remoteObj.Object.ObjectId).Do()
+
+		box, err := r.getBoxModel(n.NodeId)
+		if err != nil {
+			log.Println(err)
 			return
 		}
 
@@ -329,7 +366,8 @@ func visibleText(n *dom.Node) string {
 	switch n.NodeType {
 	case NodeTypeElement:
 		if n.NodeName == "INPUT" {
-			return getAttribute(n, "value")
+			val, _ := getAttribute(n, "value")
+			return val
 		}
 	case NodeTypeText:
 		return n.NodeValue
@@ -337,19 +375,29 @@ func visibleText(n *dom.Node) string {
 	return ""
 }
 
-func getAttribute(n *dom.Node, attrName string) string {
+func getAttribute(n *dom.Node, attrName string) (string, bool) {
 	for i := 0; i < len(n.Attributes); i += 2 {
 		if n.Attributes[i] == attrName {
-			return n.Attributes[i+1]
+			return n.Attributes[i+1], true
 		}
 	}
-	return ""
+	return "", false
+}
+
+func removeAttribute(n *dom.Node, attrName string) {
+	for i := 0; i < len(n.Attributes); i += 2 {
+		if n.Attributes[i] == attrName {
+			n.Attributes = append(n.Attributes[:i], n.Attributes[i+2:]...)
+			return
+		}
+	}
 }
 
 func (r *testRunner) getStyle(nodeId dom.NodeId, styleName string) string {
 	style, err := r.cl.CSS.GetComputedStyleForNode().NodeId(nodeId).Do()
 	if err != nil {
-		panic(err)
+		log.Println(err)
+		return ""
 	}
 
 	for _, s := range style.ComputedStyle {
