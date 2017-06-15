@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"image/png"
 
@@ -48,7 +49,11 @@ type testRunner struct {
 	nodes       map[dom.NodeId]*dom.Node
 	events      chan interface{}
 	testLog     io.Writer
+	scanTimer   *time.Timer
+	scanPending bool
 }
+
+const scanDelay = time.Second
 
 func main() {
 	var test struct {
@@ -63,6 +68,8 @@ func main() {
 	r := &testRunner{
 		steps:       test.Steps,
 		currentStep: &Step{},
+		scanTimer:   time.NewTimer(scanDelay),
+		scanPending: true,
 	}
 
 	var err error
@@ -116,129 +123,142 @@ func main() {
 
 	r.consumeStep()
 
-	for e := range r.events {
-		log.Printf("%T\n", e)
-		switch e := e.(type) {
-		case *dom.DocumentUpdatedEvent:
-			r.nodes = make(map[dom.NodeId]*dom.Node)
-
-			result, err := r.cl.DOM.GetDocument().Do()
-			if err != nil {
-				panic(err)
-			}
-			r.doc = result.Root
-			registerNodes(r.doc)
-
-			r.cl.DOM.RequestChildNodes().NodeId(r.doc.NodeId).Depth(-1).Do()
-
-		case *dom.SetChildNodesEvent:
-			parent, ok := r.nodes[e.ParentId]
-			if !ok {
-				log.Printf("SetChildNodesEvent: node not found: %d", e.ParentId)
-				break
-			}
-			parent.Children = e.Nodes
-			for _, n := range e.Nodes {
-				registerNodes(n)
-				r.searchDOM(n)
-			}
-
-		case *dom.ChildNodeCountUpdatedEvent:
-			n, ok := r.nodes[e.NodeId]
-			if !ok {
-				log.Printf("ChildNodeCountUpdatedEvent: node not found: %d", e.NodeId)
-				break
-			}
-			n.ChildNodeCount = e.ChildNodeCount
-
-		case *dom.ChildNodeInsertedEvent:
-			parent, ok := r.nodes[e.ParentNodeId]
-			if !ok {
-				log.Printf("ChildNodeInsertedEvent: node not found: %d", e.ParentNodeId)
-				break
-			}
-			parent.ChildNodeCount++
-
-			i := 0
-			if e.PreviousNodeId != 0 {
-				i = childIndex(parent, e.PreviousNodeId) + 1
-			}
-
-			parent.Children = append(parent.Children, nil)
-			copy(parent.Children[i+1:], parent.Children[i:])
-			parent.Children[i] = e.Node
-
-			registerNodes(e.Node)
-			r.searchDOM(e.Node)
-
-			r.cl.DOM.RequestChildNodes().NodeId(e.Node.NodeId).Depth(-1).Do()
-
-		case *dom.ChildNodeRemovedEvent:
-			parent, ok := r.nodes[e.ParentNodeId]
-			if !ok {
-				log.Printf("ChildNodeRemovedEvent: node not found: %d", e.ParentNodeId)
-				break
-			}
-			parent.ChildNodeCount--
-
-			i := childIndex(parent, e.NodeId)
-			parent.Children = append(parent.Children[:i], parent.Children[i+1:]...)
-
-		case *dom.AttributeModifiedEvent:
-			n, ok := r.nodes[e.NodeId]
-			if !ok {
-				log.Printf("AttributeModifiedEvent: node not found: %d", e.NodeId)
-				break
-			}
-			removeAttribute(n, e.Name)
-			n.Attributes = append(n.Attributes, e.Name, e.Value)
-			r.searchDOM(n)
-
-		case *dom.AttributeRemovedEvent:
-			n, ok := r.nodes[e.NodeId]
-			if !ok {
-				log.Printf("AttributeRemovedEvent: node not found: %d", e.NodeId)
-				break
-			}
-			removeAttribute(n, e.Name)
-			r.searchDOM(n)
-
-		case *page.FrameNavigatedEvent:
-			if e.Frame.URL == "about:blank" {
-				break
-			}
-			if e.Frame.ParentId != "" {
-				r.logPanel(fmt.Sprintf(`Frame navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
-				break
-			}
-			r.logPanel(fmt.Sprintf(`Navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
-
-		case *Step:
-			json.NewEncoder(os.Stderr).Encode(e)
-			switch e.Action {
-			case "navigate":
-				r.logPanel(fmt.Sprintf(`Navigate to <a href="%s">%s</a>`, e.URL, e.URL), "success")
-				if _, err := r.cl.Page.Navigate().URL(e.URL).Do(); err != nil {
-					panic(err)
-				}
-				r.consumeStep()
-
+	for {
+		select {
+		case <-r.scanTimer.C:
+			r.scanPending = false
+			switch r.currentStep.Action {
 			case "find", "click":
 				if r.doc != nil {
-					r.searchDOM(r.doc)
+					log.Printf("scan: %s", r.currentStep.Action)
+					r.scanNode(r.doc)
+				}
+			}
+
+		case e := <-r.events:
+			// reset scan timer
+			if r.scanPending {
+				if !r.scanTimer.Stop() {
+					<-r.scanTimer.C
+				}
+			}
+			r.scanTimer.Reset(scanDelay)
+			r.scanPending = true
+
+			log.Printf("%T\n", e)
+			switch e := e.(type) {
+			case *dom.DocumentUpdatedEvent:
+				r.nodes = make(map[dom.NodeId]*dom.Node)
+
+				result, err := r.cl.DOM.GetDocument().Do()
+				if err != nil {
+					panic(err)
+				}
+				r.doc = result.Root
+				registerNodes(r.doc)
+
+				r.cl.DOM.RequestChildNodes().NodeId(r.doc.NodeId).Depth(-1).Do()
+
+			case *dom.SetChildNodesEvent:
+				parent, ok := r.nodes[e.ParentId]
+				if !ok {
+					log.Printf("SetChildNodesEvent: node not found: %d", e.ParentId)
+					break
+				}
+				parent.Children = e.Nodes
+				for _, n := range e.Nodes {
+					registerNodes(n)
 				}
 
-			case "type":
-				for _, c := range e.Text {
-					r.cl.Input.DispatchKeyEvent().Type("keyDown").Text(string(c)).Do()
-					r.cl.Input.DispatchKeyEvent().Type("keyUp").Text(string(c)).Do()
+			case *dom.ChildNodeCountUpdatedEvent:
+				n, ok := r.nodes[e.NodeId]
+				if !ok {
+					log.Printf("ChildNodeCountUpdatedEvent: node not found: %d", e.NodeId)
+					break
 				}
-				r.logScreenshot(fmt.Sprintf("Type %q:", e.Text), "success", r.screenshot())
-				r.consumeStep()
+				n.ChildNodeCount = e.ChildNodeCount
 
-			case "printDOM":
-				printDOM(r.doc, 0)
-				r.consumeStep()
+			case *dom.ChildNodeInsertedEvent:
+				parent, ok := r.nodes[e.ParentNodeId]
+				if !ok {
+					log.Printf("ChildNodeInsertedEvent: node not found: %d", e.ParentNodeId)
+					break
+				}
+				parent.ChildNodeCount++
+
+				i := 0
+				if e.PreviousNodeId != 0 {
+					i = childIndex(parent, e.PreviousNodeId) + 1
+				}
+
+				parent.Children = append(parent.Children, nil)
+				copy(parent.Children[i+1:], parent.Children[i:])
+				parent.Children[i] = e.Node
+
+				registerNodes(e.Node)
+
+				r.cl.DOM.RequestChildNodes().NodeId(e.Node.NodeId).Depth(-1).Do()
+
+			case *dom.ChildNodeRemovedEvent:
+				parent, ok := r.nodes[e.ParentNodeId]
+				if !ok {
+					log.Printf("ChildNodeRemovedEvent: node not found: %d", e.ParentNodeId)
+					break
+				}
+				parent.ChildNodeCount--
+
+				i := childIndex(parent, e.NodeId)
+				parent.Children = append(parent.Children[:i], parent.Children[i+1:]...)
+
+			case *dom.AttributeModifiedEvent:
+				n, ok := r.nodes[e.NodeId]
+				if !ok {
+					log.Printf("AttributeModifiedEvent: node not found: %d", e.NodeId)
+					break
+				}
+				removeAttribute(n, e.Name)
+				n.Attributes = append(n.Attributes, e.Name, e.Value)
+
+			case *dom.AttributeRemovedEvent:
+				n, ok := r.nodes[e.NodeId]
+				if !ok {
+					log.Printf("AttributeRemovedEvent: node not found: %d", e.NodeId)
+					break
+				}
+				removeAttribute(n, e.Name)
+
+			case *page.FrameNavigatedEvent:
+				if e.Frame.URL == "about:blank" {
+					break
+				}
+				if e.Frame.ParentId != "" {
+					r.logPanel(fmt.Sprintf(`Frame navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
+					break
+				}
+				r.logPanel(fmt.Sprintf(`Navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
+
+			case *Step:
+				json.NewEncoder(os.Stderr).Encode(e)
+				switch e.Action {
+				case "navigate":
+					r.logPanel(fmt.Sprintf(`Navigate to <a href="%s">%s</a>`, e.URL, e.URL), "success")
+					if _, err := r.cl.Page.Navigate().URL(e.URL).Do(); err != nil {
+						panic(err)
+					}
+					r.consumeStep()
+
+				case "type":
+					for _, c := range e.Text {
+						r.cl.Input.DispatchKeyEvent().Type("keyDown").Text(string(c)).Do()
+						r.cl.Input.DispatchKeyEvent().Type("keyUp").Text(string(c)).Do()
+					}
+					r.logScreenshot(fmt.Sprintf("Type %q:", e.Text), "success", r.screenshot())
+					r.consumeStep()
+
+				case "printDOM":
+					printDOM(r.doc, 0)
+					r.consumeStep()
+				}
 			}
 		}
 	}
@@ -280,11 +300,14 @@ const NodeTypeAttribute = 2
 const NodeTypeText = 3
 const NodeTypeComment = 8
 
-func (r *testRunner) searchDOM(n *dom.Node) {
+func (r *testRunner) scanNode(n *dom.Node) {
 	r.matchNode(n)
 
 	for _, c := range n.Children {
-		r.searchDOM(c)
+		r.scanNode(c)
+	}
+	if n.ContentDocument != nil {
+		r.scanNode(n.ContentDocument)
 	}
 }
 
