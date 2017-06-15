@@ -42,18 +42,20 @@ type Selector struct {
 }
 
 type testRunner struct {
-	steps       []*Step
-	currentStep *Step
-	cl          *cdp.Client
-	doc         *dom.Node
-	nodes       map[dom.NodeId]*dom.Node
-	events      chan interface{}
-	testLog     io.Writer
-	scanTimer   *time.Timer
-	scanPending bool
+	steps        []*Step
+	currentStep  *Step
+	cl           *cdp.Client
+	doc          *dom.Node
+	nodes        map[dom.NodeId]*dom.Node
+	events       chan interface{}
+	testLog      io.Writer
+	scanTimer    *time.Timer
+	scanPending  bool
+	timeoutTimer *time.Timer
 }
 
 const scanDelay = time.Second
+const timeoutDelay = 10 * time.Second
 
 func main() {
 	var test struct {
@@ -66,11 +68,13 @@ func main() {
 	}
 
 	r := &testRunner{
-		steps:       test.Steps,
-		currentStep: &Step{},
-		scanTimer:   time.NewTimer(scanDelay),
-		scanPending: true,
+		steps:        test.Steps,
+		currentStep:  &Step{},
+		scanTimer:    time.NewTimer(scanDelay),
+		scanPending:  true,
+		timeoutTimer: time.NewTimer(timeoutDelay),
 	}
+	r.timeoutTimer.Stop()
 
 	var err error
 	r.testLog, err = os.Create("log.html")
@@ -134,6 +138,11 @@ func main() {
 					r.scanNode(r.doc)
 				}
 			}
+
+		case <-r.timeoutTimer.C:
+			log.Printf("timeout")
+			r.logScreenshot("Timeout while looking for element:", "danger", r.screenshot())
+			os.Exit(1)
 
 		case e := <-r.events:
 			// reset scan timer
@@ -246,6 +255,9 @@ func main() {
 						panic(err)
 					}
 					r.consumeStep()
+
+				case "find", "click":
+					r.timeoutTimer.Reset(timeoutDelay)
 
 				case "type":
 					for _, c := range e.Text {
@@ -381,6 +393,9 @@ func (r *testRunner) matchNode(n *dom.Node) {
 			r.cl.Input.DispatchMouseEvent().Type("mouseReleased").Button("left").X(x).Y(y).ClickCount(1).Do()
 		}
 
+		if !r.timeoutTimer.Stop() {
+			<-r.timeoutTimer.C
+		}
 		r.consumeStep()
 	}
 }
