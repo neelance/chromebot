@@ -28,6 +28,12 @@ type Box struct {
 	X, Y, W, H int
 }
 
+type Test struct {
+	Name    string  `json:"name"`
+	Timeout int     `json:"timeout"`
+	Steps   []*Step `json:"steps"`
+}
+
 type Step struct {
 	Action   string   `json:"action"`
 	Selector Selector `json:"selector"`
@@ -42,7 +48,7 @@ type Selector struct {
 }
 
 type testRunner struct {
-	steps        []*Step
+	test         *Test
 	currentStep  *Step
 	cl           *cdp.Client
 	doc          *dom.Node
@@ -55,24 +61,22 @@ type testRunner struct {
 }
 
 const scanDelay = time.Second
-const timeoutDelay = 10 * time.Second
 
 func main() {
-	var test struct {
-		Name  string  `json:"name"`
-		Steps []*Step `json:"steps"`
-	}
-
+	var test Test
 	if err := json.NewDecoder(os.Stdin).Decode(&test); err != nil {
 		panic(err)
 	}
+	if test.Timeout == 0 {
+		test.Timeout = 10
+	}
 
 	r := &testRunner{
-		steps:        test.Steps,
+		test:         &test,
 		currentStep:  &Step{},
 		scanTimer:    time.NewTimer(scanDelay),
 		scanPending:  true,
-		timeoutTimer: time.NewTimer(timeoutDelay),
+		timeoutTimer: time.NewTimer(time.Hour), // stopped immediately
 	}
 	r.timeoutTimer.Stop()
 
@@ -257,7 +261,7 @@ func main() {
 					r.consumeStep()
 
 				case "find", "click":
-					r.timeoutTimer.Reset(timeoutDelay)
+					r.timeoutTimer.Reset(time.Duration(r.test.Timeout) * time.Second)
 
 				case "type":
 					for _, c := range e.Text {
@@ -299,11 +303,11 @@ func printDOM(n *dom.Node, indent int) {
 }
 
 func (r *testRunner) consumeStep() {
-	if len(r.steps) == 0 {
+	if len(r.test.Steps) == 0 {
 		os.Exit(0)
 	}
-	r.currentStep = r.steps[0]
-	r.steps = r.steps[1:]
+	r.currentStep = r.test.Steps[0]
+	r.test.Steps = r.test.Steps[1:]
 	r.events <- r.currentStep
 }
 
