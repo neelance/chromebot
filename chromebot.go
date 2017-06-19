@@ -354,7 +354,7 @@ func (r *testRunner) matchNode(n *dom.Node) {
 				return
 			}
 			switch sel.Background {
-			case "bright":
+			case "light":
 				y, _, _ := color.RGBToYCbCr(c.R, c.G, c.B)
 				if y < 128 {
 					return
