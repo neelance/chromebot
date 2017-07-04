@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -138,14 +139,13 @@ func main() {
 			switch r.currentStep.Action {
 			case "find", "click":
 				if r.doc != nil {
-					log.Printf("scan: %s", r.currentStep.Action)
 					r.scanNode(r.doc)
 				}
 			}
 
 		case <-r.timeoutTimer.C:
 			log.Printf("timeout")
-			r.logScreenshot("Timeout while looking for element:", "danger", r.screenshot())
+			r.logScreenshot("Timeout while looking for element", "danger", r.screenshot())
 			os.Exit(1)
 
 		case e := <-r.events:
@@ -158,7 +158,7 @@ func main() {
 			r.scanTimer.Reset(scanDelay)
 			r.scanPending = true
 
-			log.Printf("%T\n", e)
+			log.Printf("Event: %T\n", e)
 			switch e := e.(type) {
 			case *dom.DocumentUpdatedEvent:
 				r.nodes = make(map[dom.NodeId]*dom.Node)
@@ -251,7 +251,7 @@ func main() {
 				r.logPanel(fmt.Sprintf(`Navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
 
 			case *Step:
-				json.NewEncoder(os.Stderr).Encode(e)
+				log.Printf("Step: %+v", e)
 				switch e.Action {
 				case "navigate":
 					r.logPanel(fmt.Sprintf(`Navigate to <a href="%s">%s</a>`, e.URL, e.URL), "success")
@@ -268,7 +268,7 @@ func main() {
 						r.cl.Input.DispatchKeyEvent().Type("keyDown").Text(string(c)).Do()
 						r.cl.Input.DispatchKeyEvent().Type("keyUp").Text(string(c)).Do()
 					}
-					r.logScreenshot(fmt.Sprintf("Type %q:", e.Text), "success", r.screenshot())
+					r.logScreenshot(fmt.Sprintf("Type %q", e.Text), "success", r.screenshot())
 					r.consumeStep()
 
 				case "printDOM":
@@ -304,6 +304,7 @@ func printDOM(n *dom.Node, indent int) {
 
 func (r *testRunner) consumeStep() {
 	if len(r.test.Steps) == 0 {
+		r.logPanel("Test successful", "success")
 		os.Exit(0)
 	}
 	r.currentStep = r.test.Steps[0]
@@ -388,9 +389,9 @@ func (r *testRunner) matchNode(n *dom.Node) {
 
 		switch r.currentStep.Action {
 		case "find":
-			r.logScreenshot("Find element:", "success", dc.Image())
+			r.logScreenshot("Find element", "success", dc.Image())
 		case "click":
-			r.logScreenshot("Click on element:", "success", dc.Image())
+			r.logScreenshot("Click on element", "success", dc.Image())
 			x := box.X + (box.W / 2)
 			y := box.Y + (box.H / 2)
 			r.cl.Input.DispatchMouseEvent().Type("mousePressed").Button("left").X(x).Y(y).ClickCount(1).Do()
@@ -492,7 +493,10 @@ func (r *testRunner) screenshot() image.Image {
 	return img
 }
 
+var stripTags = regexp.MustCompile("<.*?>")
+
 func (r *testRunner) logScreenshot(title string, panelType string, img image.Image) {
+	log.Printf("Log: %s", stripTags.ReplaceAllString(title, ""))
 	fmt.Fprintf(r.testLog, `
 		<div class="panel panel-%s">
 			<div class="panel-heading">%s</div>
@@ -506,6 +510,7 @@ func (r *testRunner) logScreenshot(title string, panelType string, img image.Ima
 }
 
 func (r *testRunner) logPanel(title string, panelType string) {
+	log.Printf("Log: %s", stripTags.ReplaceAllString(title, ""))
 	fmt.Fprintf(r.testLog, `
 		<div class="panel panel-%s">
 			<div class="panel-heading">%s</div>
