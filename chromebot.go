@@ -139,7 +139,43 @@ func main() {
 			switch r.currentStep.Action {
 			case "find", "click":
 				if r.doc != nil {
-					r.scanNode(r.doc)
+					n, _ := r.findNode(r.doc, &r.currentStep.Selector)
+					if n == nil {
+						continue
+					}
+
+					remoteObj, err := r.cl.DOM.ResolveNode().NodeId(n.NodeId).Do()
+					if err != nil {
+						log.Println(err)
+						continue
+					}
+					r.cl.Runtime.CallFunctionOn().FunctionDeclaration("function(){this.scrollIntoViewIfNeeded(true);}").ObjectId(remoteObj.Object.ObjectId).Silent(true).Do()
+					r.cl.Runtime.ReleaseObject().ObjectId(remoteObj.Object.ObjectId).Do()
+
+					box, err := r.getBoxModel(n.NodeId)
+					if err != nil {
+						log.Println(err)
+						continue
+					}
+
+					dc := gg.NewContextForImage(r.screenshot())
+					addHighlight(dc, box)
+
+					switch r.currentStep.Action {
+					case "find":
+						r.logScreenshot("Find element", "success", dc.Image())
+					case "click":
+						r.logScreenshot("Click on element", "success", dc.Image())
+						x := box.X + (box.W / 2)
+						y := box.Y + (box.H / 2)
+						r.cl.Input.DispatchMouseEvent().Type("mousePressed").Button("left").X(x).Y(y).ClickCount(1).Do()
+						r.cl.Input.DispatchMouseEvent().Type("mouseReleased").Button("left").X(x).Y(y).ClickCount(1).Do()
+					}
+
+					if !r.timeoutTimer.Stop() {
+						<-r.timeoutTimer.C
+					}
+					r.consumeStep()
 				}
 			}
 
@@ -176,7 +212,7 @@ func main() {
 				parent, ok := r.nodes[e.ParentId]
 				if !ok {
 					log.Printf("SetChildNodesEvent: node not found: %d", e.ParentId)
-					break
+					continue
 				}
 				parent.Children = e.Nodes
 				for _, n := range e.Nodes {
@@ -187,7 +223,7 @@ func main() {
 				n, ok := r.nodes[e.NodeId]
 				if !ok {
 					log.Printf("ChildNodeCountUpdatedEvent: node not found: %d", e.NodeId)
-					break
+					continue
 				}
 				n.ChildNodeCount = e.ChildNodeCount
 
@@ -195,7 +231,7 @@ func main() {
 				parent, ok := r.nodes[e.ParentNodeId]
 				if !ok {
 					log.Printf("ChildNodeInsertedEvent: node not found: %d", e.ParentNodeId)
-					break
+					continue
 				}
 				parent.ChildNodeCount++
 
@@ -216,7 +252,7 @@ func main() {
 				parent, ok := r.nodes[e.ParentNodeId]
 				if !ok {
 					log.Printf("ChildNodeRemovedEvent: node not found: %d", e.ParentNodeId)
-					break
+					continue
 				}
 				parent.ChildNodeCount--
 
@@ -227,7 +263,7 @@ func main() {
 				n, ok := r.nodes[e.NodeId]
 				if !ok {
 					log.Printf("AttributeModifiedEvent: node not found: %d", e.NodeId)
-					break
+					continue
 				}
 				removeAttribute(n, e.Name)
 				n.Attributes = append(n.Attributes, e.Name, e.Value)
@@ -236,17 +272,17 @@ func main() {
 				n, ok := r.nodes[e.NodeId]
 				if !ok {
 					log.Printf("AttributeRemovedEvent: node not found: %d", e.NodeId)
-					break
+					continue
 				}
 				removeAttribute(n, e.Name)
 
 			case *page.FrameNavigatedEvent:
 				if e.Frame.URL == "about:blank" {
-					break
+					continue
 				}
 				if e.Frame.ParentId != "" {
 					r.logPanel(fmt.Sprintf(`Frame navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
-					break
+					continue
 				}
 				r.logPanel(fmt.Sprintf(`Navigated to <a href="%s">%s</a>`, e.Frame.URL, e.Frame.URL), "default")
 
@@ -317,105 +353,80 @@ const NodeTypeAttribute = 2
 const NodeTypeText = 3
 const NodeTypeComment = 8
 
-func (r *testRunner) scanNode(n *dom.Node) {
-	r.matchNode(n)
-
-	for _, c := range n.Children {
-		r.scanNode(c)
-	}
-	if n.ContentDocument != nil {
-		r.scanNode(n.ContentDocument)
-	}
-}
-
-func (r *testRunner) matchNode(n *dom.Node) {
-	switch r.currentStep.Action {
-	case "find", "click":
-		sel := r.currentStep.Selector
-
-		if !strings.Contains(visibleText(n), sel.Text) {
-			return
-		}
-
-		if n.NodeType == NodeTypeText {
-			n = r.nodes[n.ParentId]
-		}
-
-		for name, expected := range sel.Attributes {
-			got, ok := getAttribute(n, name)
-			if (expected == nil && ok) || (expected != nil && (!ok || *expected != got)) {
-				return
-			}
-		}
-
-		if sel.Background != "" {
-			sc := r.getStyle(n.NodeId, "background-color")
-			c := parseCSSColor(sc)
-			if c == nil {
-				return
-			}
-			switch sel.Background {
-			case "light":
-				y, _, _ := color.RGBToYCbCr(c.R, c.G, c.B)
-				if y < 128 {
-					return
-				}
-			case "dark":
-				y, _, _ := color.RGBToYCbCr(c.R, c.G, c.B)
-				if y >= 128 {
-					return
-				}
-			default:
-				panic("invalid color selector")
-			}
-		}
-
-		remoteObj, err := r.cl.DOM.ResolveNode().NodeId(n.NodeId).Do()
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		r.cl.Runtime.CallFunctionOn().FunctionDeclaration("function(){this.scrollIntoViewIfNeeded(true);}").ObjectId(remoteObj.Object.ObjectId).Silent(true).Do()
-		r.cl.Runtime.ReleaseObject().ObjectId(remoteObj.Object.ObjectId).Do()
-
-		box, err := r.getBoxModel(n.NodeId)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		dc := gg.NewContextForImage(r.screenshot())
-		addHighlight(dc, box)
-
-		switch r.currentStep.Action {
-		case "find":
-			r.logScreenshot("Find element", "success", dc.Image())
-		case "click":
-			r.logScreenshot("Click on element", "success", dc.Image())
-			x := box.X + (box.W / 2)
-			y := box.Y + (box.H / 2)
-			r.cl.Input.DispatchMouseEvent().Type("mousePressed").Button("left").X(x).Y(y).ClickCount(1).Do()
-			r.cl.Input.DispatchMouseEvent().Type("mouseReleased").Button("left").X(x).Y(y).ClickCount(1).Do()
-		}
-
-		if !r.timeoutTimer.Stop() {
-			<-r.timeoutTimer.C
-		}
-		r.consumeStep()
-	}
-}
-
-func visibleText(n *dom.Node) string {
+func (r *testRunner) findNode(n *dom.Node, sel *Selector) (*dom.Node, string) {
+	var text string
 	switch n.NodeType {
 	case NodeTypeElement:
 		if n.NodeName == "INPUT" {
-			val, _ := getAttribute(n, "value")
-			return val
+			text, _ = getAttribute(n, "value")
 		}
 	case NodeTypeText:
-		return n.NodeValue
+		text = n.NodeValue
+	default:
+		text = ""
 	}
-	return ""
+
+	for _, c := range n.Children {
+		result, childText := r.findNode(c, sel)
+		if result != nil {
+			return result, ""
+		}
+		text += childText
+	}
+
+	if r.matchNode(n, text, sel) {
+		return n, ""
+	}
+
+	if n.ContentDocument != nil {
+		result, _ := r.findNode(n.ContentDocument, sel)
+		if result != nil {
+			return result, ""
+		}
+	}
+
+	return nil, text
+}
+
+func (r *testRunner) matchNode(n *dom.Node, text string, sel *Selector) bool {
+	if n.NodeType != NodeTypeElement {
+		return false
+	}
+
+	if !strings.Contains(text, sel.Text) {
+		return false
+	}
+
+	for name, expected := range sel.Attributes {
+		got, ok := getAttribute(n, name)
+		if (expected == nil && ok) || (expected != nil && (!ok || *expected != got)) {
+			return false
+		}
+	}
+
+	if sel.Background != "" {
+		sc := r.getStyle(n.NodeId, "background-color")
+		c := parseCSSColor(sc)
+		if c == nil {
+			return false
+		}
+		switch sel.Background {
+		case "light":
+			y, _, _ := color.RGBToYCbCr(c.R, c.G, c.B)
+			if y < 128 {
+				return false
+			}
+		case "dark":
+			y, _, _ := color.RGBToYCbCr(c.R, c.G, c.B)
+			if y >= 128 {
+				return false
+			}
+		default:
+			panic("invalid color selector")
+		}
+	}
+
+	return true
 }
 
 func getAttribute(n *dom.Node, attrName string) (string, bool) {
